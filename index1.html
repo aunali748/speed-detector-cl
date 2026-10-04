@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Live Vision: objects, emotions and speed</title>
+<style>
+:root{--bg:#101827;--fg:#f1f5f9;--mut:#94a3b8;--per:#fbbf24;--obj:#22d3ee}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font:16px/1.4 ui-rounded,system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;gap:14px;padding:18px}
+h1{margin:0;font-size:1.3rem}
+#stage{position:relative;width:100%;max-width:840px;aspect-ratio:4/3;background:#000;border-radius:14px;overflow:hidden}
+video,canvas{position:absolute;inset:0;width:100%;height:100%}
+button{border:0;border-radius:10px;padding:11px 20px;font:600 1rem system-ui;cursor:pointer;background:var(--per);color:#1c1400}
+button.alt{background:#1e293b;color:var(--fg)}
+button:focus-visible{outline:3px solid var(--obj);outline-offset:2px}
+#s{margin:0;color:var(--mut);font-size:.9rem;text-align:center;max-width:60ch}
+</style>
+</head>
+<body>
+<h1>Live Vision</h1>
+<div id="stage"><video id="v" playsinline muted></video><canvas id="c"></canvas></div>
+<div><button id="go">Start camera</button> <button id="flip" class="alt" hidden>Flip camera</button></div>
+<p id="s">Names objects and people, reads emotions, estimates speed. Everything runs in your browser and no video leaves your device.</p>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3"></script>
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.js"></script>
+<script>
+const $ = id => document.getElementById(id), v = $('v'), c = $('c'), g = c.getContext('2d'), s = $('s');
+const EMO = {happy:'😊', sad:'😢', angry:'😠', fearful:'😨', disgusted:'🤢', surprised:'😲', neutral:'😐'};
+// Typical real-world heights in metres, used to convert pixels into km/h (approximate)
+const H = {person:1.7, bicycle:1.1, car:1.5, motorcycle:1.2, bus:3, truck:3, dog:.5, cat:.3, horse:1.6,
+           bottle:.25, cup:.1, chair:.9, laptop:.25, 'cell phone':.15, book:.22};
+let model, facing = 'environment', stream, tracks = [], faces = [], frame = 0;
+
+async function cam() {
+  stream?.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:facing, width:{ideal:960}}, audio:false});
+  v.srcObject = stream; await v.play();
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  $('stage').style.aspectRatio = c.width + '/' + c.height;
+}
+
+// Match detections to earlier ones (same class, nearest centre) and measure movement every 250 ms
+function track(dets, t) {
+  const used = new Set();
+  const out = dets.map(d => {
+    const [x, y, w, h] = d.bbox, cx = x + w/2, cy = y + h/2;
+    let k = null, best = Math.max(w, h);
+    for (const q of tracks) if (q.c == d.class && !used.has(q)) {
+      const dist = Math.hypot(q.cx - cx, q.cy - cy);
+      if (dist < best) { best = dist; k = q; }
+    }
+    if (!k) { k = {c:d.class, ax:cx, ay:cy, at:t, v:0}; tracks.push(k); }
+    else if (t - k.at >= 250) {
+      k.v = (k.v + Math.hypot(cx - k.ax, cy - k.ay) / ((t - k.at) / 1000)) / 2;
+      k.ax = cx; k.ay = cy; k.at = t;
+    }
+    Object.assign(k, {cx, cy, seen:t}); used.add(k);
+    return [d, k];
+  });
+  tracks = tracks.filter(q => t - q.seen < 1000);
+  return out;
+}
+
+function draw(items) {
+  g.clearRect(0, 0, c.width, c.height);
+  const fs = Math.max(14, c.width / 38);
+  g.font = `600 ${fs}px system-ui`; g.lineWidth = Math.max(2, c.width / 300);
+  for (const [d, k] of items) {
+    const [x, y, w, h] = d.bbox, person = d.class == 'person', col = person ? '#fbbf24' : '#22d3ee';
+    let label = d.class;
+    if (person) {
+      const f = faces.find(f => { const b = f.detection.box, mx = b.x + b.width/2, my = b.y + b.height/2;
+                                  return mx > x && mx < x + w && my > y && my < y + h; });
+      if (f) { const [e] = Object.entries(f.expressions).sort((a, b) => b[1] - a[1])[0]; label += ` ${EMO[e]} ${e}`; }
+    }
+    label += H[d.class] ? `  ${(k.v / h * H[d.class] * 3.6).toFixed(1)} km/h` : `  ${Math.round(k.v)} px/s`;
+    const ty = Math.max(0, y - fs - 8);
+    g.strokeStyle = col; g.strokeRect(x, y, w, h);
+    g.fillStyle = col; g.fillRect(x, ty, g.measureText(label).width + 12, fs + 8);
+    g.fillStyle = '#1c1400'; g.fillText(label, x + 6, ty + fs);
+  }
+}
+
+async function loop() {
+  const t = performance.now();
+  if (v.readyState >= 2) {
+    const dets = await model.detect(v, 20, 0.5);
+    if (frame++ % 3 == 0)   // emotions every 3rd frame to stay fast
+      faces = await faceapi.detectAllFaces(v, new faceapi.TinyFaceDetectorOptions()).withFaceExpressions();
+    draw(track(dets, t));
+    s.textContent = `Live, ${Math.round(1000 / (performance.now() - t))} fps, ${dets.length} detected. Speed is approximate sideways motion.`;
+  }
+  requestAnimationFrame(loop);
+}
+
+$('go').onclick = async e => {
+  e.target.disabled = true;
+  try {
+    s.textContent = 'Starting camera...'; await cam();
+    s.textContent = 'Loading AI models (about 10 seconds the first time)...';
+    for (const T of [tf, faceapi.tf].filter(Boolean)) {   // avoid the uninitialised 'wasm' default
+      if (!await T.setBackend('webgl')) await T.setBackend('cpu');
+      await T.ready();
+    }
+    const M = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/model/';
+    [model] = await Promise.all([cocoSsd.load(), faceapi.nets.tinyFaceDetector.loadFromUri(M), faceapi.nets.faceExpressionNet.loadFromUri(M)]);
+    e.target.hidden = true; $('flip').hidden = false;
+    loop();
+  } catch (err) { s.textContent = 'Could not start: ' + err.message + ' (allow camera access and use https).'; e.target.disabled = false; }
+};
+$('flip').onclick = () => { facing = facing == 'user' ? 'environment' : 'user'; cam(); };
+</script>
+</body>
+</html>
